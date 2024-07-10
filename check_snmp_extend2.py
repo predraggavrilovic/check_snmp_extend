@@ -8,8 +8,8 @@
 # Patches Welcome!
 # https://github.com/nickanderson/check_snmp_extend
 
-# rewriten to work with python 3
-# 
+# version 0.3, bare minimum rewrite to make this work
+# with python 3
 ###################################################
 #
 # IMPORT
@@ -32,6 +32,17 @@ from optparse import OptionParser
 
 overall_status = -1
 
+ok=0
+unknown=1
+warning=2
+critical=3
+
+state = {
+	ok			: "OK",
+	unknown		: "UNKNOWN",
+	warning		: "WARNING",
+	critical	: "CRITICAL"
+}
 
 state_nagios = {
 	"OK"		:	0,
@@ -46,7 +57,12 @@ state_nagios_text = {
 	3	: "UNKNOWN"
 }
 
-
+exit_codes = {
+	0	:	state_nagios["OK"],
+	1	:	state_nagios["UNKNOWN"],
+	2	:	state_nagios["WARNING"],
+	3	:	state_nagios["CRITICAL"]
+}
 
 summary=""
 long_output=""
@@ -82,37 +98,43 @@ def timeout():
 		return f2
 	return timeout_function
 
+	
+def clean_line_result(text):
+	ret = ['', '']
+	
+	text2=text.split('=',1)
+	#plugin name :
+	ret[0]=text2[0].split('.',1)[1].replace('"','').strip()
+	#return code removing the ending \n:
+	ret[1]=int(text2[1].rstrip('\n'))
+	return ret
+	
+def clean_line_output(text):
+	ret = ['', '', '', '']
+	
+	text2=text.split('=',1)
+	#plugin name :
+	ret[0]=text2[0].split('.',1)[1].replace('"','').strip()
+	#return (code, text, etc.) removing the ending \n
+	text3=text2[1].rstrip('\n')
+	#return summary
+	ret[1]=text3.split('|',1)[0].split('\n')[0].strip()
+	#return perfdata
+	try:
+		ret[2]=text3.split('|',1)[1].split('\n')[0].strip()
+		try: #more perfdata (nagios syntax guide says it's correct -_-)
+			ret[2]="%s %s" % (ret[2], text3.split('|',2)[2].strip())
+		except IndexError:
+			pass
+	except IndexError:
+			pass
+	#return long output
+	try: #split on | left side because we can have perfdata after long output
+		ret[3]=text3.split('\n')[1].split('|')[0].strip()
+	except IndexError:
+		pass
 
-def parse_single_result(single_result):
-	label,value=single_result.split("=")
-	label=label.replace('"','').strip()
-	value=int(value.strip())
-	return (label,value)
-
-def parse_single_output(single_output):
-	p_name=""
-	p_summ=""
-	p_perf=""
-	p_long=""
-	firstline_and_rest=single_output.split('\n',1)
-	firstline=firstline_and_rest.pop(0)
-	p_name_summ_perf=firstline.split('|')
-	p_name_summ=p_name_summ_perf.pop(0)
-	p_name,p_summ=p_name_summ.split("=")
-	p_name=p_name.strip().replace('"','')
-	p_summ=p_summ.strip()
-	if p_name_summ_perf:
-		p_perf=p_name_summ_perf.pop().strip()
-	if firstline_and_rest:
-		longout_and_moreperf=firstline_and_rest.pop().split('|')
-		p_long=longout_and_moreperf.pop(0).strip()
-		if longout_and_moreperf:
-			moreperf=longout_and_moreperf.pop().strip()
-			moreperf=moreperf.replace('\n'," ")
-			p_perf=p_perf+" "+moreperf
-	return(p_name,p_summ,p_perf,p_long)
-
-
+	return ret
 
 ###################################################
 #				
@@ -121,97 +143,125 @@ def parse_single_output(single_output):
 ###################################################
 def check_snmp_extend():
 	global overall_status, ok_count, not_ok_count
-	resultlist=[]
+	
 	output_table={}
-	noexecstr="No Such Instance currently exists at this OID"
+	timeoutstr="snmpwalk: Timeout"
+	#timeoutstr="Timeout: No Response from " + options.host
+	noexecstr="::nsExtendResult = No Such Instance currently exists at this OID"
 	if options.snmp_version == '3':
 		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult' ]
 	
 	else:
-		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-c', options.community, '-m', 'NET-SNMP-EXTEND-MIB', '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult']
+		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-c', options.community, '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult']
 	
 		
-	try:
-		snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE,check=True)
-	except subprocess.CalledProcessError as exc:
-		error(f'snmpwalk error {exc.returncode}\n{exc.stderr.decode("utf-8")}')
-	
-	results = snmp_request_process.stdout.decode("utf-8").strip().split("NET-SNMP-EXTEND-MIB::nsExtendResult.")
-	results.pop(0)
+	snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	print("evo", snmp_request_process.stdout.decode("utf-8").replace('NET-SNMP-EXTEND-MIB::nsExtendResult.',''))
+	results = snmp_request_process.stdout.decode("utf-8").strip().split("NET-SNMP-EXTEND-MIB")
+	print("evoga", results)
 	
     
 	if options.debug:
 		debug("snmp request: %s" % " ".join(snmp_request_list))
 		debug(results)
 
-	if results[0] == noexecstr:
+	if results[0] == timeoutstr:
+		error("No response from: %s. Maybe community is not good ?" % (options.host) )
+	if results[1] == noexecstr:
 		error("No extend snmp found for this server: %s." % (options.host) )
 	
 	if options.snmp_version == '3':
-		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-m', 'NET-SNMP-EXTEND-MIB', '-m', 'NET-SNMP-EXTEND-MIB', '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull' ]
+		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull' ]
 		
 	else:
-		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-c', options.community, '-m', 'NET-SNMP-EXTEND-MIB', '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull']
+		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-c', options.community, '-OQ', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull']
 		
 	
-	try:
-		snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE,check=True)
-	except subprocess.CalledProcessError as exc:
-		error(f'snmpget error {exc.returncode}\n{exc.stderr.decode("utf-8")}')
-
-	outputs=snmp_request_process.stdout.decode("utf-8").strip().split("NET-SNMP-EXTEND-MIB::nsExtendOutputFull.")
-	outputs.pop(0) 
+	snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	outputs=snmp_request_process.stdout.decode("utf-8").strip().split("NET-SNMP-EXTEND-MIB") 
 	
 	if options.debug:
 		debug("snmp request: %s" % " ".join(snmp_request_list))
 		debug(outputs)
 
-	
-	if results[0] == noexecstr:
+	if results[0] == timeoutstr:
+		error("No response from: %s. Maybe community is not good ?" % (options.host) )
+	if results[1] == noexecstr:
 		error("No extend snmp found for this server: %s." % (options.host) )	
-	
-	for single_result in results:
-		plugin_name,plugin_return_code=parse_single_result(single_result)
-		output_table[plugin_name]={"Result": plugin_return_code}
-		resultlist.append(plugin_return_code)
-		if plugin_return_code==state_nagios["OK"]:
-			ok_count+=1
-		else:
-			not_ok_count+=1
-	
 		
-	for single_output in outputs:
-		plugin_name, plugin_return_summary, plugin_return_perfdata, plugin_return_long_output=parse_single_output(single_output)
+	for i in range(1,len(results)): #skip 0 as it's empty because of split
+		cleaned_result=clean_line_result(results[i])
+		
+		plugin_name=cleaned_result[0]
+		plugin_return_code=int(cleaned_result[1])
+		if not plugin_name in output_table :
+			output_table[plugin_name]={
+				"Name"			:	"",
+				"Result"		:	unknown,
+				"Summary"		:	"",
+				"Perfdata"		:	"",
+				"LongOutput"	:	""
+			}
+		
+		#output_table[plugin_name]["Name"]=plugin_name
+		output_table[plugin_name]["Result"]=plugin_return_code
+	
+	for i in range(1,len(outputs)): #skip 0 as it's empty because of split
+		cleaned_output=clean_line_output(outputs[i])
+		
+		plugin_name=cleaned_output[0]
+		plugin_return_summary=cleaned_output[1]
+		plugin_return_perfdata=cleaned_output[2]
+		plugin_return_long_output=cleaned_output[3]
+		
+		if not plugin_name in output_table :
+			output_table[plugin_name]={
+				"Name"			:	"",
+				"Result"		:	unknown,
+				"Summary"		:	"",
+				"Perfdata"		:	"",
+				"LongOutput"	:	""
+			}
+			
+		#output_table[plugin_name]["Name"]=plugin_name
 		output_table[plugin_name]["Summary"]=plugin_return_summary
 		output_table[plugin_name]["Perfdata"]=plugin_return_perfdata
 		output_table[plugin_name]["LongOutput"]=plugin_return_long_output
-		
-		
-	if state_nagios["CRITICAL"] in resultlist:
-		overall_status=state_nagios["CRITICAL"]
-	elif state_nagios["WARNING"] in resultlist:
-		overall_status=state_nagios["WARNING"]
-	elif state_nagios["UNKNOWN"] in resultlist:
-		overall_status=state_nagios["UNKNOWN"]
-	elif state_nagios["OK"] in resultlist:
-		overall_status=state_nagios["OK"]
-	else:
-		overall_status=state_nagios["UNKNOWN"]
 	
-	for extend_name,extend_data in output_table.items():
-		if options.output_complete_summary:
-			add_summary("%s=%s, " % (extend_name,extend_data["Summary"]) )
+		
+	
+	for snmp_extend in output_table.items():
+	
+		#stupid nagios rules, unknown return code is > critical ...
+		#so a dirty method is applied here to avoid this
+		if snmp_extend[1]["Result"]==state_nagios["OK"]:
+			overall_status = max(overall_status,ok)
+		elif snmp_extend[1]["Result"]==state_nagios["WARNING"]:
+			overall_status = max(overall_status,warning)
+		elif snmp_extend[1]["Result"]==state_nagios["CRITICAL"]:
+			overall_status = max(overall_status,critical)
 		else:
-			add_summary("%s=%s, " % (extend_name,state_nagios_text[extend_data["Result"]]) )
+			overall_status = max(overall_status,unknown)
+			
+		if options.output_complete_summary:
+			add_summary("%s=%s, " % (snmp_extend[0],snmp_extend[1]["Summary"]) )
+		else:
+			add_summary("%s=%s, " % (snmp_extend[0],state_nagios_text[snmp_extend[1]["Result"]]) )
 		
-		if extend_data["Perfdata"] != "" and options.output_perfdata:
-			add_perfdata("%s" % (extend_data["Perfdata"]) )
-		
-		if extend_data["LongOutput"] != "" and options.output_longoutput:
-			add_long_output("%s=%s, " % (extend_name, extend_data["LongOutput"]) )
-		if options.debug:
-			debug("extend name: %s, summary: %s, perfdata: %s, longoutput: %s" % (extend_name, extend_data["Summary"], extend_data["Perfdata"], extend_data["LongOutput"]) )
+		if snmp_extend[1]["Perfdata"] != "" and options.output_perfdata:
+			add_perfdata("%s" % (snmp_extend[1]["Perfdata"]) )
 	
+		if snmp_extend[1]["LongOutput"] != "" and options.output_longoutput:
+			add_long_output("%s=%s, " % (snmp_extend[0], snmp_extend[1]["LongOutput"]) )
+	
+		if snmp_extend[1]["Result"] > ok:
+			not_ok_count+=1
+		else:
+			ok_count+=1
+		
+		if options.debug:
+			debug("extend name: %s, summary: %s, perfdata: %s, longoutput: %s" % (snmp_extend[0], snmp_extend[1]["Summary"], snmp_extend[1]["Perfdata"], snmp_extend[1]["LongOutput"]) )
+
 	
 		
 ###################################################
@@ -222,20 +272,21 @@ def check_snmp_extend():
 def check_this_snmp_extend():
 	global overall_status
 	
+	output_table={}
+	
+	timeoutstr="snmpget: Timeout"
 	noexecstr="No Such Instance currently exists at this OID"
 
 	if options.snmp_version == '3':
-		snmp_request_list = ['snmpget', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-m', 'NET-SNMP-EXTEND-MIB', '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult.'+ f'"{options.extend_name}"','NET-SNMP-EXTEND-MIB::nsExtendOutputFull.'+ f'"{options.extend_name}"']
+		snmp_request_list = ['snmpget', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult.'+ f'"{options.extend_name}"']
 		
 	else:
-		snmp_request_list = ['snmpget', '-v', options.snmp_version, '-c', options.community, '-m', 'NET-SNMP-EXTEND-MIB', '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult.'+ f'"{options.extend_name}"','NET-SNMP-EXTEND-MIB::nsExtendOutputFull.'+ f'"{options.extend_name}"']
+		snmp_request_list = ['snmpget', '-v', options.snmp_version, '-c', options.community, '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendResult.'+ f'"{options.extend_name}"']
 		
-	try:
-		snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-	except subprocess.CalledProcessError as exc:
-		error(f'snmpget error {exc.returncode}\n{exc.stderr.decode("utf-8")}')
-	process_output=snmp_request_process.stdout.decode("utf-8").strip()
-	result,output=process_output.split('\n',1)
+
+	snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	result=snmp_request_process.stdout.decode("utf-8").strip()
+	
 	
 	if options.debug:
 		debug("snmp request: %s" % " ".join(snmp_request_list))
@@ -243,9 +294,28 @@ def check_this_snmp_extend():
 	
 	if result == noexecstr:
 		error("This extend module is not found for this server: %s" %(options.extend_name) )
-	
+	if result == timeoutstr:
+		error("No response from: %s. Maybe community is not good ?" % (options.host) )
 		
-			
+	if options.snmp_version == '3':
+		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-u', options.snmp_user, '-l', options.snmp_seclevel, '-a', options.snmp_authproto, '-A', options.snmp_authpass, '-x', options.snmp_privproto, '-X',  options.snmp_privpass, '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull.'+ f'"{options.extend_name}"']
+		
+	else:
+		snmp_request_list = ['snmpwalk', '-v', options.snmp_version, '-c', options.community, '-OQv', options.host, 'NET-SNMP-EXTEND-MIB::nsExtendOutputFull.'+ f'"{options.extend_name}"']
+		
+
+	snmp_request_process=subprocess.run(snmp_request_list,stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	output=snmp_request_process.stdout.decode("utf-8").strip()
+	
+	if options.debug:
+		debug("snmp request: %s" % " ".join(snmp_request_list))
+		debug(output)
+	
+	if result == noexecstr:
+		error("This extend module is not found for this server: %s" %(options.extend_name) )
+	if result == timeoutstr:
+		error("No response from: %s. Maybe community is not good ?" % (options.host) )
+		
 	overall_status = int(result)
 
 	
@@ -349,9 +419,11 @@ def parse_options():
 # error(text, exitcode)	
 #	print error text
 ###################################################
-def error(errortext, exit_code=state_nagios["UNKNOWN"]):
+def error(errortext, exit_code=unknown):
 	print("* Error: %s" % errortext)
-	exit(exit_code)
+	#print_help()
+	#:print "* Error: %s" % errortext
+	exit(exit_codes[exit_code])
 
 ###################################################
 #				
@@ -422,15 +494,15 @@ def end():
 	global overall_status
 	
 	if overall_status < 0 or overall_status > 3:
-		overall_status = state_nagios["UNKNOWN"]
+		overall_status = unknown
 	
 	if options.extend_name == 'ALL':
-		message = "%s - ok objects: %s, not ok objects: %s - %s" % (state_nagios_text[overall_status], ok_count, not_ok_count, summary)
+		message = "%s - ok objects: %s, not ok objects: %s - %s" % (state[overall_status], ok_count, not_ok_count, summary)
 		if perfdata != "" and options.output_perfdata:
 			message = "%s | %s" % (message, perfdata)
 		if long_output != "" and options.output_longoutput:
 			message = "%s \n %s" % (message, long_output)
-		exit_code = overall_status
+		exit_code = exit_codes[overall_status]
 	else:
 		message = "%s" % (summary)
 		exit_code = overall_status
